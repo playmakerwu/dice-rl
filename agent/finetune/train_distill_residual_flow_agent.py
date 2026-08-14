@@ -899,6 +899,16 @@ class TrainDistillResidualFlowAgent(TrainAgent):
         # Reset step counter for online RL (warmstart steps don't count towards online training)
         total_steps = 0
         self.current_training_step = 0  # Initialize training step tracker
+
+        # CHANGED begin: optional resume from an earlier run's model_step_N.pth.
+        # Restores model + optimizers + schedulers and restarts the step counter
+        # at the checkpoint's step. The replay buffer is NOT in those
+        # checkpoints (save_model never wrote it), so it restarts cold.
+        resume_ckpt = self.cfg.get("resume_ckpt", None)
+        if resume_ckpt:
+            total_steps = self._resume_from(resume_ckpt)
+            self.current_training_step = total_steps
+        # CHANGED end
         
         # Reset environments initially
         prev_obs_venv = self.reset_env_all()
@@ -1049,7 +1059,8 @@ class TrainDistillResidualFlowAgent(TrainAgent):
                         f"buffer_size={len(self.replay_buffer)}")
             
         # Final evaluation and save
-        self.evaluate(total_steps)
+        if self.cfg.get('run_eval', False) and hasattr(self, 'eval_venv'):  # CHANGED: same gate as the in-loop eval (crashes otherwise)
+            self.evaluate(total_steps)
         # self.save_model(total_steps)
         log.info("Training completed")
     
@@ -1075,6 +1086,33 @@ class TrainDistillResidualFlowAgent(TrainAgent):
         torch.save(save_dict, save_path)
         log.info(f"Model saved to {save_path}")
     
+    # CHANGED begin: resume from an explicit checkpoint path (load() below only
+    # looks inside self.logdir and requires a 'replay_buffer' key that
+    # save_model never writes, so it cannot resume across runs).
+    def _resume_from(self, ckpt_path):
+        """Load model/optimizer/scheduler state; return the checkpoint's step."""
+        # weights_only=False: our own checkpoints embed the omegaconf config
+        checkpoint = torch.load(ckpt_path, map_location=self.device,
+                                weights_only=False)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.actor_optimizer.load_state_dict(
+            checkpoint['actor_optimizer_state_dict'])
+        self.critic_optimizer.load_state_dict(
+            checkpoint['critic_optimizer_state_dict'])
+        if 'actor_scheduler_state_dict' in checkpoint \
+                and self.actor_scheduler is not None:
+            self.actor_scheduler.load_state_dict(
+                checkpoint['actor_scheduler_state_dict'])
+        if 'critic_scheduler_state_dict' in checkpoint \
+                and self.critic_scheduler is not None:
+            self.critic_scheduler.load_state_dict(
+                checkpoint['critic_scheduler_state_dict'])
+        step = int(checkpoint.get('step', 0))
+        log.info(f"Resumed model/optimizers/schedulers from {ckpt_path} "
+                 f"at step {step} (replay buffer restarts cold)")
+        return step
+    # CHANGED end
+
     def load(self, step):
         """Load the model and training state."""
         load_path = os.path.join(self.logdir, f"model_step_{step}.pth")
