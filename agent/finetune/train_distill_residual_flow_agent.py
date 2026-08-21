@@ -278,6 +278,10 @@ class TrainDistillResidualFlowAgent(TrainAgent):
             full_trajectory_info=full_trajectory_info  # List of trajectory dicts from MultiStepFull
         )
     
+    # CHANGED (ADDED 2026-08-18): identity hook; subclasses may add critic terms.
+    def _augment_critic_loss(self, loss_dict, training_step):
+        return loss_dict
+
     def update_networks(self, training_step: int = 0):
         """
         Update all networks using data from replay buffer.
@@ -328,7 +332,10 @@ class TrainDistillResidualFlowAgent(TrainAgent):
             n_steps=n_steps,  # Pass n_steps for per-sample gamma computation
             data_source=data_source,  # Pass data source labels (0=online, 1=expert)
         )
-        
+        # CHANGED (ADDED 2026-08-18): subclass hook to add extra critic terms
+        # (e.g. EBM-guided conservative loss). Base impl is the identity.
+        loss_dict = self._augment_critic_loss(loss_dict, training_step)
+
         # Add Q-analysis metrics if computed
         if self.log_q_overestimation and q_overestimation is not None:
             # Separate rewards for online and offline data
@@ -1057,6 +1064,7 @@ class TrainDistillResidualFlowAgent(TrainAgent):
                 self.save_model(total_steps)
                 log.info(f"Step {total_steps}/{self.num_train_steps}: "
                         f"buffer_size={len(self.replay_buffer)}")
+                self._eval_at_ckpt(total_steps)  # CHANGED: per-ckpt dual-domain eval
             
         # Final evaluation and save
         if self.cfg.get('run_eval', False) and hasattr(self, 'eval_venv'):  # CHANGED: same gate as the in-loop eval (crashes otherwise)
@@ -1064,6 +1072,73 @@ class TrainDistillResidualFlowAgent(TrainAgent):
         # self.save_model(total_steps)
         log.info("Training completed")
     
+    # CHANGED begin: per-checkpoint dual-domain eval (opt-in via cfg.eval_at_ckpt:
+    # {mujoco_n: 32, wm_n: 8, n_envs: 4, pretrain_cfg: <path>|null, mujoco_gl: egl}).
+    # Each domain runs as a BLOCKING subprocess so the GPU is never shared between
+    # training and evaluation — concurrent MuJoCo evals measured systematically low
+    # (2026-08-15: same ckpt 2/32 under load vs 19/32 idle). Results append to
+    # <logdir>/eval_curve.jsonl; failures are logged and never kill training.
+    def _eval_at_ckpt(self, step):
+        ec = self.cfg.get("eval_at_ckpt", None)
+        if not ec:
+            return
+        import json as _json
+        import subprocess
+        import sys as _sys
+        repo = os.environ.get("IWS_REPO",
+                              "/home/yiru/Documents/interactive_world_sim")
+        script = os.path.join(repo, "rl/dice/evaluate_residual.py")
+        ckpt = os.path.join(self.logdir, f"model_step_{step}.pth")
+        outj = os.path.join(self.logdir, "eval_curve.jsonl")
+        env = dict(os.environ)
+        env["MUJOCO_GL"] = str(ec.get("mujoco_gl", "egl"))
+        # CHANGED (2026-08-16c): dm_control (imported in-process by the noisy-start
+        # sampler) writes PYOPENGL_PLATFORM=osmesa into os.environ; passing it on
+        # kills the EGL eval subprocess (AsyncVectorEnv workers die -> BrokenPipe).
+        env.pop("PYOPENGL_PLATFORM", None)
+        env["PYTHONPATH"] = repo + os.pathsep + os.path.join(repo, "external/dice-rl") \
+            + os.pathsep + env.get("PYTHONPATH", "")
+        for env_name, n_key, default_n in (("mujoco", "mujoco_n", 32),
+                                           ("wm", "wm_n", 8)):
+            n = int(ec.get(n_key, default_n))
+            if n <= 0:
+                continue
+            tmp = ckpt + f".eval_{env_name}.json"
+            cmd = [_sys.executable, "-u", script, "--checkpoints", ckpt,
+                   "--env", env_name, "--n-episodes", str(n),
+                   "--n-envs", str(int(ec.get("n_envs", 4))), "--out", tmp]
+            if ec.get("pretrain_cfg", None):
+                cmd += ["--pretrain-cfg", str(ec.get("pretrain_cfg"))]
+            try:
+                # CHANGED (2026-08-16b): capture stderr + one retry — transient
+                # eval-subprocess failures observed under dual-training load.
+                for attempt in (1, 2):
+                    p = subprocess.run(cmd, env=env, timeout=3600,
+                                       capture_output=True, text=True)
+                    if p.returncode == 0:
+                        break
+                    log.warning(f"[eval_at_ckpt] step {step} {env_name} attempt "
+                                f"{attempt} rc={p.returncode} stderr tail: "
+                                f"{p.stderr[-500:]}")
+                else:
+                    raise RuntimeError(f"eval failed twice rc={p.returncode}")
+                if p.returncode != 0:
+                    raise RuntimeError(f"eval failed rc={p.returncode}")
+                r = _json.load(open(tmp))
+                r = r[0] if isinstance(r, list) else r
+                rec = {"step": step, "env": env_name, "n": r["n"],
+                       "success": r["success"], "success_rate": r["success_rate"],
+                       "best_mpd_median": r.get("best_mpd_median"),
+                       "ang_err_median": r.get("ang_err_median")}
+                with open(outj, "a") as f:
+                    f.write(_json.dumps(rec) + "\n")
+                log.info(f"[eval_at_ckpt] step {step} {env_name}: "
+                         f"{r['success']}/{r['n']} ({100*r['success_rate']:.1f}%)")
+                os.remove(tmp)
+            except Exception as exc:  # noqa: BLE001 -- eval must not kill training
+                log.warning(f"[eval_at_ckpt] step {step} {env_name} FAILED: {exc}")
+    # CHANGED end
+
     def save_model(self, step=None):
         """Save the model and training state."""
         if step is None:

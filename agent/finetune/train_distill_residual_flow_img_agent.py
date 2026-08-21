@@ -394,13 +394,15 @@ class TrainDistillResidualFlowImgAgent(TrainDistillResidualFlowAgent):
                             self, "_ebm_filter_calls", 0) + 1
                         if self._ebm_filter_calls % 200 == 1:
                             k = keep.cpu().numpy()
+                            d = np.delete(E, k)  # CHANGED (2026-08-18): may be empty when keep == all
+                            d_txt = (f"[{d.min():.2f},{d.max():.2f}]"
+                                     if d.size else "[none]")
                             log.info(
                                 f"[ebm_filter] call {self._ebm_filter_calls} "
                                 f"step {self.current_training_step}: "
                                 f"kept {len(k)}/{len(E)} "
                                 f"E kept[{E[k].min():.2f},{E[k].max():.2f}] "
-                                f"dropped[{np.delete(E, k).min():.2f},"
-                                f"{np.delete(E, k).max():.2f}]")
+                                f"dropped{d_txt}")
                         return keep
                 action_venv, noise_venv = self.model.get_exploration_action(
                     augmented_state,
