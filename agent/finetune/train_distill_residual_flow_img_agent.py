@@ -131,22 +131,6 @@ class TrainDistillResidualFlowImgAgent(TrainDistillResidualFlowAgent):
         
         self.current_training_step = 0
 
-        # CHANGED begin: optional EBM energy pre-filter over exploration
-        # candidates (cfg.ebm_filter: {ckpt, keep}). Training-time only; the
-        # evaluate() override below bypasses it so eval semantics stay
-        # identical to unfiltered runs.
-        self.ebm_chunk_filter = None
-        self._in_eval = False
-        ebm_cfg = cfg.get("ebm_filter", None)
-        if ebm_cfg is not None:
-            from rl.dice.ebm_chunk_filter import EBMChunkFilter
-            self.ebm_chunk_filter = EBMChunkFilter(
-                ckpt_path=ebm_cfg["ckpt"], keep=int(ebm_cfg["keep"]),
-                device=self.device)
-            log.info(f"  EBM chunk filter: {ebm_cfg['ckpt']} "
-                     f"keep {ebm_cfg['keep']}/{self.num_exploration_samples}")
-        # CHANGED end
-
         log.info(f"TrainDistillResidualFlowImgAgent initialized successfully")
         log.info(f"  Model obs_dim: {self.model.obs_dim}")
         log.info(f"  Visual feature extraction will be done in agent")
@@ -379,39 +363,12 @@ class TrainDistillResidualFlowImgAgent(TrainDistillResidualFlowAgent):
             
             # Generate actions based on the specified strategy
             if strategy != "standard":
-                # CHANGED begin: EBM pre-filter closure over the CURRENT clean
-                # frame + prev abs action. Active only during training rollouts.
-                candidate_filter = None
-                if self.ebm_chunk_filter is not None and not self._in_eval:
-                    frame_u8 = self.venv.envs[0].unwrapped._rgb_clean
-                    prev_abs = np.asarray(obs_venv["state"],
-                                          np.float64).reshape(-1)[:4]
-
-                    def candidate_filter(acts):
-                        keep = self.ebm_chunk_filter(frame_u8, prev_abs, acts)
-                        E = self.ebm_chunk_filter.last_energies
-                        self._ebm_filter_calls = getattr(
-                            self, "_ebm_filter_calls", 0) + 1
-                        if self._ebm_filter_calls % 200 == 1:
-                            k = keep.cpu().numpy()
-                            d = np.delete(E, k)  # CHANGED (2026-08-18): may be empty when keep == all
-                            d_txt = (f"[{d.min():.2f},{d.max():.2f}]"
-                                     if d.size else "[none]")
-                            log.info(
-                                f"[ebm_filter] call {self._ebm_filter_calls} "
-                                f"step {self.current_training_step}: "
-                                f"kept {len(k)}/{len(E)} "
-                                f"E kept[{E[k].min():.2f},{E[k].max():.2f}] "
-                                f"dropped{d_txt}")
-                        return keep
                 action_venv, noise_venv = self.model.get_exploration_action(
-                    augmented_state,
+                    augmented_state, 
                     num_samples=self.num_exploration_samples,
                     exploration_strategy=strategy,
-                    training_step=self.current_training_step,  # Use current training step from parent's run()
-                    candidate_filter=candidate_filter,
+                    training_step=self.current_training_step  # Use current training step from parent's run()
                 )
-                # CHANGED end
             else:
                 # Standard action generation (single sample with random noise)
                 # Use batch size from augmented_state to handle both training (n_envs) and evaluation (eval_n_envs)
@@ -420,17 +377,7 @@ class TrainDistillResidualFlowImgAgent(TrainDistillResidualFlowAgent):
                 action_venv = self.model.get_action(augmented_state, noise_venv)
 
         return action_venv, noise_venv
-
-    # CHANGED begin: evaluation must not be shaped by the EBM filter — eval
-    # numbers stay comparable with unfiltered baselines.
-    def evaluate(self, *args, **kwargs):
-        self._in_eval = True
-        try:
-            return super().evaluate(*args, **kwargs)
-        finally:
-            self._in_eval = False
-    # CHANGED end
-
+    
     def collect_transition(self, obs_venv, action_venv, noise_venv, reward_venv, done_venv, next_obs_venv, info_venv=None):
         """        
         All inputs are already tensors from the parent's run() method.

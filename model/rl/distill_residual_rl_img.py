@@ -132,8 +132,7 @@ class DistillResidualRLImgModel(DistillResidualRLModel):
 
     def get_exploration_action(self, state: torch.Tensor, num_samples: int = 10,
                               exploration_strategy: str = "max_q_std", training_step: int = 0,
-                              replay_flow_model=None, replay_flow_config=None,
-                              candidate_filter=None) -> Tuple[torch.Tensor, torch.Tensor]:  # CHANGED: optional pre-Q candidate filter
+                              replay_flow_model=None, replay_flow_config=None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Get exploration action using specified strategy.
         
@@ -176,24 +175,7 @@ class DistillResidualRLImgModel(DistillResidualRLModel):
         # Get actions for all noise samples
         with torch.no_grad():
             actions_flat = self.get_action(state_flat, noise_flat)  # (num_samples * B, horizon_steps, action_dim)
-
-            # CHANGED begin: optional external candidate filter (e.g. EBM energy
-            # pre-screen). Runs BEFORE any Q evaluation, so the strategy below
-            # only ever ranks the surviving subset. No-op when None.
-            if candidate_filter is not None:
-                assert B == 1, "candidate_filter supports n_envs == 1 only"
-                keep = candidate_filter(
-                    actions_flat.view(num_samples, self.horizon_steps,
-                                      self.action_dim))
-                keep = torch.as_tensor(keep, device=device,
-                                       dtype=torch.long).view(-1)
-                num_samples = int(keep.numel())
-                noise_samples = noise_samples[keep]
-                actions_flat = actions_flat[keep]
-                noise_flat = noise_flat[keep]
-                state_flat = state_flat[keep]
-            # CHANGED end
-
+            
             # Get Q-values from all critics for all samples
             q_all = self.critic(state_flat, noise_flat, actions_flat, return_all=True)  # List of (num_samples * B, 1)
             

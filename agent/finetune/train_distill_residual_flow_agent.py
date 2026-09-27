@@ -278,10 +278,6 @@ class TrainDistillResidualFlowAgent(TrainAgent):
             full_trajectory_info=full_trajectory_info  # List of trajectory dicts from MultiStepFull
         )
     
-    # CHANGED (ADDED 2026-08-18): identity hook; subclasses may add critic terms.
-    def _augment_critic_loss(self, loss_dict, training_step):
-        return loss_dict
-
     def update_networks(self, training_step: int = 0):
         """
         Update all networks using data from replay buffer.
@@ -332,10 +328,6 @@ class TrainDistillResidualFlowAgent(TrainAgent):
             n_steps=n_steps,  # Pass n_steps for per-sample gamma computation
             data_source=data_source,  # Pass data source labels (0=online, 1=expert)
         )
-        # CHANGED (ADDED 2026-08-18): subclass hook to add extra critic terms
-        # (e.g. EBM-guided conservative loss). Base impl is the identity.
-        loss_dict = self._augment_critic_loss(loss_dict, training_step)
-
         # Add Q-analysis metrics if computed
         if self.log_q_overestimation and q_overestimation is not None:
             # Separate rewards for online and offline data
@@ -1109,6 +1101,21 @@ class TrainDistillResidualFlowAgent(TrainAgent):
                    "--n-envs", str(int(ec.get("n_envs", 4))), "--out", tmp]
             if ec.get("pretrain_cfg", None):
                 cmd += ["--pretrain-cfg", str(ec.get("pretrain_cfg"))]
+            # CHANGED (ADDED 2026-08-29, user): optional episode-step-cap override.
+            # evaluate_residual.py's own --max-steps default (150) undercounts centre1
+            # (whose demos run to 224 steps; eval_robo01_loop.sh already works around this
+            # with --max-steps 250 --mj-episode-cap 250 for every *centre1* arm). Absent
+            # (None) reproduces the prior 150-step behaviour bit for bit.
+            if ec.get("max_steps", None):
+                cmd += ["--max-steps", str(int(ec.get("max_steps")))]
+                if env_name == "mujoco":
+                    cmd += ["--mj-episode-cap", str(int(ec.get("max_steps")))]
+            # CHANGED (ADDED 2026-08-29, user): optional reset-set override, so a run can
+            # be auto-evaluated against a different reset set than its pretrain_cfg's
+            # default (e.g. a positive-angle-only eval set) without touching that shared
+            # cfg file. Absent (None) reproduces the prior behaviour bit for bit.
+            if ec.get("reset_set", None):
+                cmd += ["--reset-set", str(ec.get("reset_set"))]
             try:
                 # CHANGED (2026-08-16b): capture stderr + one retry — transient
                 # eval-subprocess failures observed under dual-training load.
@@ -1128,7 +1135,10 @@ class TrainDistillResidualFlowAgent(TrainAgent):
                 r = r[0] if isinstance(r, list) else r
                 rec = {"step": step, "env": env_name, "n": r["n"],
                        "success": r["success"], "success_rate": r["success_rate"],
-                       "best_mpd_median": r.get("best_mpd_median"),
+                       # CHANGED (2026-09-14, user "以后全部使用box"): the evaluator's
+                       # headline success IS the box criterion now and MPD is gone; this
+                       # records the box distance median in its place.
+                       "best_box_median": r.get("best_box_median"),
                        "ang_err_median": r.get("ang_err_median")}
                 with open(outj, "a") as f:
                     f.write(_json.dumps(rec) + "\n")
