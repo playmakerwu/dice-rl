@@ -1090,12 +1090,21 @@ class TrainDistillResidualFlowAgent(TrainAgent):
         env.pop("PYOPENGL_PLATFORM", None)
         env["PYTHONPATH"] = repo + os.pathsep + os.path.join(repo, "external/dice-rl") \
             + os.pathsep + env.get("PYTHONPATH", "")
-        for env_name, n_key, default_n in (("mujoco", "mujoco_n", 32),
-                                           ("wm", "wm_n", 8)):
-            n = int(ec.get(n_key, default_n))
+        # CHANGED (ADDED 2026-11-19): eval_at_ckpt.mujoco_sets = [{reset_set, n}, ...] -> one MuJoCo evaluation per set (e.g. the
+        # task's training starts and its held-out test starts), each eval_curve.jsonl row tagged with its reset_set. Absent -> the
+        # single mujoco_n / reset_set evaluation as before, bit for bit.
+        jobs = []
+        msets = ec.get("mujoco_sets", None)
+        if msets:
+            for k, ms in enumerate(msets):
+                jobs.append(("mujoco", int(ms["n"]), str(ms["reset_set"]), f"{k}"))
+        else:
+            jobs.append(("mujoco", int(ec.get("mujoco_n", 32)), ec.get("reset_set", None), None))
+        jobs.append(("wm", int(ec.get("wm_n", 8)), ec.get("reset_set", None), None))
+        for env_name, n, rset, tag in jobs:
             if n <= 0:
                 continue
-            tmp = ckpt + f".eval_{env_name}.json"
+            tmp = ckpt + f".eval_{env_name}{tag or ''}.json"
             cmd = [_sys.executable, "-u", script, "--checkpoints", ckpt,
                    "--env", env_name, "--n-episodes", str(n),
                    "--n-envs", str(int(ec.get("n_envs", 4))), "--out", tmp]
@@ -1114,8 +1123,8 @@ class TrainDistillResidualFlowAgent(TrainAgent):
             # be auto-evaluated against a different reset set than its pretrain_cfg's
             # default (e.g. a positive-angle-only eval set) without touching that shared
             # cfg file. Absent (None) reproduces the prior behaviour bit for bit.
-            if ec.get("reset_set", None):
-                cmd += ["--reset-set", str(ec.get("reset_set"))]
+            if rset:                                         # CHANGED (2026-11-19): the job's set (ec.reset_set when no mujoco_sets)
+                cmd += ["--reset-set", str(rset)]
             try:
                 # CHANGED (2026-08-16b): capture stderr + one retry — transient
                 # eval-subprocess failures observed under dual-training load.
@@ -1140,9 +1149,12 @@ class TrainDistillResidualFlowAgent(TrainAgent):
                        # records the box distance median in its place.
                        "best_box_median": r.get("best_box_median"),
                        "ang_err_median": r.get("ang_err_median")}
+                if tag is not None:                          # CHANGED (ADDED 2026-11-19): which set (mujoco_sets)
+                    rec["reset_set"] = rset
                 with open(outj, "a") as f:
                     f.write(_json.dumps(rec) + "\n")
-                log.info(f"[eval_at_ckpt] step {step} {env_name}: "
+                log.info(f"[eval_at_ckpt] step {step} {env_name}"
+                         f"{'' if tag is None else ' [' + os.path.basename(str(rset)) + ']'}: "   # CHANGED (2026-11-19)
                          f"{r['success']}/{r['n']} ({100*r['success_rate']:.1f}%)")
                 os.remove(tmp)
             except Exception as exc:  # noqa: BLE001 -- eval must not kill training
