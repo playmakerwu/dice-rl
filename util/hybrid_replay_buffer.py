@@ -55,6 +55,13 @@ class HybridReplayBuffer:
         # Expert dataset n-step settings
         expert_use_n_step: bool = False,
         expert_n_step: int = 1,
+        # CHANGED (2026-11-15, DICE-style sparse bottle RL with the EBM penalty in the reward; user: "我们测试稀疏奖励，参照dice"):
+        # the EXACT n-step return over the n non-overlapping chunks t, t+h, ..., t+(n-1)h, computed from the per-step rewards when
+        # an episode is stored. The original sampler adds every row t..t+(n-1)h and each row already holds a whole chunk's summed
+        # reward, so a dense per-step reward (the EBM penalty) is counted ~3x for n=3, h=4 (a step sits in up to 4 overlapping row
+        # sums). A reward paid only on the terminal step is counted once and with the same discount either way, so for a purely
+        # sparse reward this switch changes nothing (rewards, dones and next state identical). False = the original loop.
+        n_step_chunk_aligned: bool = False,
     ):
         """
         Initialize hybrid replay buffer with episode and chunk storage.
@@ -122,6 +129,11 @@ class HybridReplayBuffer:
                                             dtype=torch.float32, device=device)
         self.chunk_dones = torch.zeros((max_size, 1), 
                                       dtype=torch.bool, device=device)
+        # CHANGED (2026-11-15): see the n_step_chunk_aligned argument -- per row, the exact aligned n-step return and its done flag
+        self.n_step_chunk_aligned = bool(n_step_chunk_aligned) and bool(use_n_step)
+        if self.n_step_chunk_aligned:
+            self.chunk_nstep_rewards = torch.zeros((max_size, 1), dtype=torch.float32, device=device)
+            self.chunk_nstep_dones = torch.zeros((max_size, 1), dtype=torch.bool, device=device)
         
         # MC return storage if needed
         if self.log_q_overestimation:
@@ -341,6 +353,16 @@ class HybridReplayBuffer:
             self.chunk_rewards[idx, 0] = chunk_reward
             self.chunk_next_states[idx] = next_state_t
             self.chunk_dones[idx, 0] = chunk_done
+            if self.n_step_chunk_aligned:   # CHANGED (2026-11-15): sum_j gamma^j * (rewards of chunk j from start_t), j < n, to the episode end
+                ret, t = 0.0, start_t
+                for j in range(self.n_step):
+                    if t >= T:
+                        break
+                    end = min(t + self.horizon_steps, T)
+                    ret += (self.gamma ** j) * float(sum(rewards[t:end]))
+                    t = end
+                self.chunk_nstep_rewards[idx, 0] = ret
+                self.chunk_nstep_dones[idx, 0] = bool(any(dones[start_t:start_t + self.n_step * self.horizon_steps]))
             
             # Compute MC return if needed (with discounting at chunk level)
             if self.log_q_overestimation:
@@ -423,7 +445,7 @@ class HybridReplayBuffer:
             # For n_step=5, we want chunks at distances 0, 1, ..., (n_step-1)*horizon_steps
             max_distance = (self.n_step - 1) * self.horizon_steps + 1
             
-            for k in range(max_distance):
+            for k in (() if self.n_step_chunk_aligned else range(max_distance)):   # CHANGED (2026-11-15): skipped when aligned
                 step_indices = indices + k  # Look at every chunk, not just every horizon_steps
                 
                 # Check if these indices are valid (don't go past buffer size)
@@ -454,6 +476,10 @@ class HybridReplayBuffer:
                 
                 # Mark as done if any chunk is done
                 n_step_dones = n_step_dones | step_dones_curr
+
+            if self.n_step_chunk_aligned:   # CHANGED (2026-11-15): the stored exact returns (see __init__) instead of the loop
+                n_step_rewards = self.chunk_nstep_rewards[indices]
+                n_step_dones = self.chunk_nstep_dones[indices]
 
             # Get the state after the last chunk in the n-step sequence
             n_step_indices = indices + (self.n_step - 1) * self.horizon_steps  # Non-overlapping: t + (n-1)*horizon_steps

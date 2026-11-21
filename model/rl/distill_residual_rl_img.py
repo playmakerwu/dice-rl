@@ -327,7 +327,7 @@ class DistillResidualRLImgModel(DistillResidualRLModel):
             # BC regularization loss: mean(||a^current_k - a^pre_k||²)
             action_diff = actions_samples - pretrained_actions_samples  # (B, K, horizon_steps, action_dim)
             # Compute MSE across action dimensions for each timestep, then average across time
-            mse_per_timestep = (action_diff ** 2).mean(dim=-1)  # (B, K, horizon_steps)
+            mse_per_timestep = self._bc_sq_err(action_diff).mean(dim=-1)  # (B, K, horizon_steps)  # CHANGED (2026-10-13): was (action_diff ** 2); per-dim weights if set
             # Average across timesteps to get per-sample MSE: (B, K)
             mse_per_sample = mse_per_timestep.mean(dim=-1)  # (B, K)
             # Mean across K samples and average across batch
@@ -422,7 +422,7 @@ class DistillResidualRLImgModel(DistillResidualRLModel):
             # Compute BC-style loss with filtering: ||current_action - pretrained_action||²
             action_diff = actions_samples - pretrained_actions_samples  # (B, K, horizon_steps, action_dim)
             # Compute MSE across action dimensions for each timestep, then average across time
-            mse_per_timestep = (action_diff ** 2).mean(dim=-1)  # (B, K, horizon_steps)
+            mse_per_timestep = self._bc_sq_err(action_diff).mean(dim=-1)  # (B, K, horizon_steps)  # CHANGED (2026-10-13): was (action_diff ** 2); per-dim weights if set
             # Average across timesteps to get per-sample MSE: (B, K)
             mse_per_sample = mse_per_timestep.mean(dim=-1)  # (B, K)
             # Apply filtering and equal weighting (no softmax weights, just equal average)

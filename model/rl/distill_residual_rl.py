@@ -226,6 +226,7 @@ class DistillResidualRLModel(nn.Module):
         activation_type: str = "Mish",
         # Loss coefficients
         bc_loss_weight: float = 1.0,
+        bc_loss_dim_weights: Optional[List[float]] = None,  # CHANGED (ADDED 2026-10-13): per-action-dim weights inside the BC term; None = upstream
         critic_weight: float = 1.0,
         # Q-filtering parameters
         use_soft_q_filtering: bool = False,
@@ -254,6 +255,9 @@ class DistillResidualRLModel(nn.Module):
         always_retain_bc_loss_for_expert_data: bool = False,
         # TD loss type for critic
         td_loss: str = "mse",  # "mse", "huber", "bce"
+        # CHANGED (2026-10-31, bottle EBM RL): clamp BCE targets to [0, 1] instead of asserting. A reward-side penalty (EBM) makes
+        # sparse-reward targets negative wherever Q(s') is near 0; False = the original assert, bit-identical.
+        bce_clamp_targets: bool = False,
         # Multi-z sampling for actor loss
         sample_multi_z_for_actor_loss: bool = False,
         num_multi_z_for_actor_loss: int = 8,
@@ -274,12 +278,21 @@ class DistillResidualRLModel(nn.Module):
         self.disable_td_loss_for_expert_data = disable_td_loss_for_expert_data
         self.always_retain_bc_loss_for_expert_data = always_retain_bc_loss_for_expert_data
         self.td_loss = td_loss
+        self.bce_clamp_targets = bool(bce_clamp_targets)  # CHANGED (2026-10-31)
         self.sample_multi_z_for_actor_loss = sample_multi_z_for_actor_loss
         self.num_multi_z_for_actor_loss = num_multi_z_for_actor_loss
         self.device = device
         
         # Loss coefficients
         self.bc_loss_weight = bc_loss_weight
+        # CHANGED (ADDED 2026-10-13): BC term = mean_d(w_d * r_d^2) instead of mean_d(r_d^2) when weights are given.
+        # Not persistent, so checkpoints keep upstream's keys; the weights come from the run's config.
+        dim_w = None
+        if bc_loss_dim_weights is not None:
+            dim_w = torch.as_tensor([float(x) for x in bc_loss_dim_weights], dtype=torch.float32, device=device)
+            if dim_w.shape != (action_dim,) or not bool((dim_w > 0).all()):
+                raise ValueError(f"bc_loss_dim_weights needs {action_dim} positive values, got {list(bc_loss_dim_weights)}")
+        self.register_buffer("bc_loss_dim_weights", dim_w, persistent=False)
         self.critic_weight = critic_weight
         
         # Q-filtering settings
@@ -624,6 +637,11 @@ class DistillResidualRLModel(nn.Module):
         
         return selected_actions, selected_noise
     
+    def _bc_sq_err(self, action_diff: torch.Tensor) -> torch.Tensor:
+        """CHANGED (ADDED 2026-10-13): squared residual, weighted per action dim when bc_loss_dim_weights is set."""
+        sq = action_diff ** 2
+        return sq if self.bc_loss_dim_weights is None else sq * self.bc_loss_dim_weights
+
     def actor_loss(
         self,
         state: torch.Tensor,
@@ -711,7 +729,7 @@ class DistillResidualRLModel(nn.Module):
             # BC regularization loss: mean(||a^current_k - a^pre_k||²)
             action_diff = actions_samples - pretrained_actions_samples  # (B, K, horizon_steps, action_dim)
             # Compute MSE across action dimensions for each timestep, then average across time
-            mse_per_timestep = (action_diff ** 2).mean(dim=-1)  # (B, K, horizon_steps)
+            mse_per_timestep = self._bc_sq_err(action_diff).mean(dim=-1)  # (B, K, horizon_steps)  # CHANGED (2026-10-13): was (action_diff ** 2); per-dim weights if set
             # Average across timesteps to get per-sample MSE: (B, K)
             mse_per_sample = mse_per_timestep.mean(dim=-1)  # (B, K)
             # Mean across K samples and average across batch
@@ -806,7 +824,7 @@ class DistillResidualRLModel(nn.Module):
             # Compute BC-style loss with filtering: ||current_action - pretrained_action||²
             action_diff = actions_samples - pretrained_actions_samples  # (B, K, horizon_steps, action_dim)
             # Compute MSE across action dimensions for each timestep, then average across time
-            mse_per_timestep = (action_diff ** 2).mean(dim=-1)  # (B, K, horizon_steps)
+            mse_per_timestep = self._bc_sq_err(action_diff).mean(dim=-1)  # (B, K, horizon_steps)  # CHANGED (2026-10-13): was (action_diff ** 2); per-dim weights if set
             # Average across timesteps to get per-sample MSE: (B, K)
             mse_per_sample = mse_per_timestep.mean(dim=-1)  # (B, K)
             # Apply filtering and equal weighting (no softmax weights, just equal average)
@@ -892,6 +910,8 @@ class DistillResidualRLModel(nn.Module):
             elif self.td_loss == "bce":
                 # Binary Cross Entropy with Logits loss
                 # q_pred are raw logits, target_q should be in [0,1]
+                if self.bce_clamp_targets:  # CHANGED (2026-10-31): see __init__
+                    target_q = target_q.clamp(0.0, 1.0)
                 # Assert that target values are in valid range
                 assert torch.all(target_q >= 0.0) and torch.all(target_q <= 1.0), \
                     f"BCE loss requires target Q-values in [0,1], got range [{target_q.min():.4f}, {target_q.max():.4f}]"

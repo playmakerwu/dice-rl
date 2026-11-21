@@ -177,6 +177,7 @@ class TrainDistillResidualFlowImgAgent(TrainDistillResidualFlowAgent):
             # Expert dataset n-step settings (can differ from online data)
             expert_use_n_step=cfg.replay_buffer.get("expert_use_n_step", False),
             expert_n_step=cfg.replay_buffer.get("expert_n_step", 1),
+            n_step_chunk_aligned=cfg.replay_buffer.get("n_step_chunk_aligned", False),  # CHANGED (2026-11-15): see HybridReplayBuffer
         )
     
     def _preprocess_expert_dataset(self, expert_dataset):
